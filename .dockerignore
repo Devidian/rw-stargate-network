@@ -1,0 +1,9 @@
+.git
+node_modules
+dist
+.pnp.cjs
+.yarn/install-state.gz
+.env*
+docs
+scripts
+deploy

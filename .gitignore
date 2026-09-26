@@ -1,0 +1,10 @@
+node_modules/
+dist/
+.pnp.cjs
+.yarn/install-state.gz
+.env*
+*.tsbuildinfo
+
+# Host-specific deployment files remain local.
+/deploy/
+/docker-compose.yml
