@@ -21,7 +21,7 @@ function connect() {
       const existing = queue.find(predicate);
       if (existing) { queue.splice(queue.indexOf(existing), 1); return Promise.resolve(existing); }
       return new Promise((done, fail) => {
-        const waiter = { predicate, resolve: done, timeout: setTimeout(() => fail(new Error('response timeout')), 5000) };
+        const waiter = { predicate, resolve: done, timeout: setTimeout(() => fail(new Error('response timeout')), 75000) };
         waiters.push(waiter);
       });
     }, send(type, requestId, networkCode, payload) {
@@ -34,12 +34,12 @@ async function run() {
   const unique = randomUUID();
   const a = await connect();
   const b = await connect();
-  let gateA, gateB;
+  let gateA, gateB, gateA2;
   try {
     for (const [client, suffix, port] of [[a, 'a', 30001], [b, 'b', 30002]]) {
       const id = `init-${suffix}`;
       client.send('initNetwork', id, undefined, { serverId: `smoke-${unique}-${suffix}`, name: `Smoke ${suffix}`,
-        host: '127.0.0.1', port, world: profile, plugins: ['OZ - Tools:0.26.2', 'OZ - Stargate:0.0.1'],
+        host: '127.0.0.1', port, dialSequenceVersion: 1, world: profile, plugins: ['OZ - Tools:0.26.2', 'OZ - Stargate:0.0.1'],
         forbiddenActions: { ChangeGameMode: true } });
       const reply = await client.wait(msg => msg.requestId === id);
       assert.equal(reply.type, 'networkReady');
@@ -73,22 +73,29 @@ async function run() {
     a.send('dialGate', 'dial-free', a.code, { gateId: gateB, originGateId: gateA });
     const incoming = await b.wait(msg => msg.type === 'dialIn');
     b.send('gateFree', 'free-answer', b.code, { gateId: gateB, dialId: incoming.payload.dialId });
-    const free = await a.wait(msg => msg.requestId === 'dial-free');
+    const free = await a.wait(msg => msg.requestId === 'dial-free' && msg.type !== 'dialProgress');
     assert.equal(free.type, 'gateFree');
     assert.equal(free.payload.port, 30002);
-    a.send('dialGate', 'dial-blocked', a.code, { gateId: gateB, originGateId: gateA });
-    const blockedIncoming = await b.wait(msg => msg.type === 'dialIn');
-    b.send('gateBlocked', 'blocked-answer', b.code, { gateId: gateB, dialId: blockedIncoming.payload.dialId });
-    assert.equal((await a.wait(msg => msg.requestId === 'dial-blocked')).type, 'gateBlocked');
-    a.send('dialGate', 'same-server', a.code, { gateId: gateA, originGateId: gateA });
-    assert.equal((await a.wait(msg => msg.requestId === 'same-server')).payload.reason, 'same_server');
+    a.send('registerGate', 'reg-a2', a.code, {});
+    gateA2 = (await a.wait(msg => msg.requestId === 'reg-a2')).payload.gateId;
+    a.send('dialGate', 'dial-blocked', a.code, { gateId: gateB, originGateId: gateA2 });
+    assert.equal((await a.wait(msg => msg.requestId === 'dial-blocked' && msg.type !== 'dialProgress')).type, 'gateBlocked');
+    a.send('dialGate', 'same-server', a.code, { gateId: gateA, originGateId: gateA2 });
+    assert.equal((await a.wait(msg => msg.requestId === 'same-server' && msg.type !== 'dialProgress')).payload.reason, 'same_server');
     a.send('unregisterGate', 'bad-owner', a.code, { gateId: gateB });
     assert.equal((await a.wait(msg => msg.requestId === 'bad-owner')).payload.code, 'gate_not_owned_or_missing');
     console.log('Stargate relay integration smoke passed');
   } finally {
-    if (gateA) a.send('unregisterGate', 'cleanup-a', a.code, { gateId: gateA });
-    if (gateB) b.send('unregisterGate', 'cleanup-b', b.code, { gateId: gateB });
-    await new Promise(resolve => setTimeout(resolve, 200));
+    for (const [client, gate, label] of [[a, gateA2, 'a2'], [a, gateA, 'a'], [b, gateB, 'b']]) {
+      if (!gate) continue;
+      client.send('unregisterGate', 'cleanup-' + label, client.code, { gateId: gate });
+      const reply = await client.wait(msg => msg.requestId === 'cleanup-' + label);
+      if (reply.payload.code === 'gate_busy') {
+        await client.wait(msg => msg.type === 'gateState' && msg.payload.gateId === gate && msg.payload.state === 'IDLE');
+        client.send('unregisterGate', 'cleanup-final-' + label, client.code, { gateId: gate });
+        assert.equal((await client.wait(msg => msg.requestId === 'cleanup-final-' + label)).type, 'gateUnregistered');
+      } else assert.equal(reply.type, 'gateUnregistered');
+    }
     a.socket.close(); b.socket.close();
   }
 }

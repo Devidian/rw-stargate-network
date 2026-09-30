@@ -1,26 +1,53 @@
+import { DialCoordinator, type DialPeer } from './dial-coordinator.js';
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
-import { MongoClient, type Collection } from 'mongodb';
+import { MongoClient, MongoServerError, type Collection } from 'mongodb';
 import WebSocket, { WebSocketServer } from 'ws';
-import { canonicalCode, MAX_PAYLOAD, parseMessage, REQUEST_TIMEOUT_MS, stringValue, TRANSFER_WINDOW_MS, type Message, type WorldProfile, WORLD_KEYS } from './protocol.js';
+import { canonicalCode, MAX_PAYLOAD, parseMessage, stringValue, TRANSFER_WINDOW_MS, type Message, type WorldProfile, WORLD_KEYS } from './protocol.js';
 
-type ServerRecord = { serverId: string; name: string; host: string; port: number; networkCode: string; computedCode: string; world: WorldProfile; plugins: string[]; forbiddenActions: Record<string, boolean>; online: boolean; updatedAt: Date };
+type ServerRecord = { serverId: string; name: string; host: string; port: number; networkCode: string; computedCode: string; world: WorldProfile; plugins: string[]; forbiddenActions: Record<string, boolean>; travelEnabled: boolean; online: boolean; updatedAt: Date };
 type GateRecord = { gateId: string; serverId: string; networkCode: string; createdAt: Date };
 type PlayerRecord = { uid: string; serverId: string; networkCode: string; name: string; playTimeSeconds: number; permissionGroup: string | null; updatedAt: Date };
-type Session = { socket: WebSocket; serverId: string; networkCode: string };
-type Pending = { origin: Session; target: Session; requestId: string; gateId: string; originGateId: string; timeout: NodeJS.Timeout };
+type Session = DialPeer & { socket: WebSocket; travelEnabled: boolean };
 type TransferState = 'PENDING' | 'ACCEPTED' | 'RELEASED' | 'CLAIMED' | 'DONE' | 'ABORTED';
 type TransferRecord = { transferId: string; uid: string; networkCode: string; sourceServerId: string; targetServerId: string;
   sourceGateId: string; targetGateId: string; state: TransferState; payload: Record<string, unknown>;
   createdAt: Date; updatedAt: Date; expiresAt: Date };
-type Window = { sourceServerId: string; targetServerId: string; sourceGateId: string; targetGateId: string; expiresAt: number };
+type Window = { sourceServerId: string; targetServerId: string; sourceGateId: string; targetGateId: string; expiresAt: number; connectionId: string };
 
 export class StargateRelay {
   private readonly sessions = new Map<string, Session>();
-  private readonly pending = new Map<string, Pending>();
+  private readonly dialing: DialCoordinator<Session>;
   private readonly windows = new Map<string, Window>();
   constructor(private readonly servers: Collection<ServerRecord>, private readonly gates: Collection<GateRecord>,
-    private readonly players: Collection<PlayerRecord>, private readonly transfers: Collection<TransferRecord>) {}
+    private readonly players: Collection<PlayerRecord>, private readonly transfers: Collection<TransferRecord>) {
+    const duration = (key: string, fallback: number, max: number) => {
+      const value = Number(process.env[key] ?? fallback);
+      if (!Number.isInteger(value) || value < 10 || value > max) throw new Error(`invalid_${key}`);
+      return value;
+    };
+    this.dialing = new DialCoordinator(async (source, gateId) => {
+      if (!source.travelEnabled) return { reason: 'network_disabled' };
+      const gate = await this.gates.findOne({ gateId, networkCode: source.networkCode });
+      if (this.sessions.get(source.serverId) !== source) return { reason: 'disconnected' };
+      if (!gate) return { reason: 'gate_unavailable' };
+      if (gate.serverId === source.serverId) return { reason: 'same_server' };
+      const peer = this.sessions.get(gate.serverId);
+      if (!peer || peer.networkCode !== source.networkCode || !peer.travelEnabled) return { reason: 'gate_offline' };
+      if (peer.dialSequenceVersion !== 1) return { reason: 'dial_sequence_required' };
+      return { peer };
+    }, (peer, type, id, payload) => this.send(peer.socket, type, id, payload), connection => {
+      this.windows.set(`${connection.source.serverId}:${connection.targetGate}`, {
+        sourceServerId: connection.source.serverId, targetServerId: connection.target.serverId,
+        sourceGateId: connection.sourceGate, targetGateId: connection.targetGate,
+        expiresAt: connection.expiresAt, connectionId: connection.id });
+    }, connection => {
+      const key = `${connection.source.serverId}:${connection.targetGate}`;
+      if (this.windows.get(key)?.connectionId === connection.id) this.windows.delete(key);
+    }, duration('DIAL_STEP_MS', 5000, 5000), duration('GATE_OPEN_MS', 60000, 60000));
+  }
+
+  async tickDialing(): Promise<void> { await this.dialing.tick(); }
 
   async initialize(): Promise<void> {
     await Promise.all([
@@ -43,14 +70,9 @@ export class StargateRelay {
     const disconnected = [...this.sessions.values()].find(s => s.socket === socket)?.serverId;
     for (const [id, session] of this.sessions) {
       if (session.socket !== socket) continue;
+      this.dialing.disconnect(session);
       this.sessions.delete(id);
       await this.servers.updateOne({ serverId: id }, { $set: { online: false, updatedAt: new Date() } });
-    }
-    for (const [dialId, pending] of this.pending) {
-      if (pending.origin.socket !== socket && pending.target.socket !== socket) continue;
-      clearTimeout(pending.timeout);
-      this.pending.delete(dialId);
-      if (pending.origin.socket !== socket) this.send(pending.origin.socket, 'dialFail', pending.requestId, { reason: 'disconnected' });
     }
     for (const [key, window] of this.windows) if (window.sourceServerId === disconnected
         || window.targetServerId === disconnected) this.windows.delete(key);
@@ -103,77 +125,78 @@ export class StargateRelay {
       throw new Error('invalid_forbidden_actions');
     }
     const forbiddenActions = (p.forbiddenActions || {}) as Record<string, boolean>;
+    if (p.travelEnabled !== undefined && typeof p.travelEnabled !== 'boolean') throw new Error('invalid_travel_enabled');
+    // Legacy plugin clients did not send this field and retain their existing routing.
+    const travelEnabled = p.travelEnabled !== false;
     const computedCode = canonicalCode(world, plugins, forbiddenActions);
     const override = typeof p.override === 'string' && p.override.trim() ? stringValue(p.override, 128) : '';
     if (override && !/^[a-zA-Z0-9_-]+$/.test(override)) throw new Error('invalid_override');
     const networkCode = override || computedCode;
     const active = this.sessions.get(serverId);
     if (active && active.socket !== socket && active.socket.readyState === WebSocket.OPEN) {
+      this.dialing.disconnect(active);
       active.socket.close(4001, 'replaced by server reconnect');
     }
     const prior = await this.servers.findOne({ serverId });
     await this.servers.updateOne({ serverId }, { $set: { serverId, name, host, port: port as number,
-      networkCode, computedCode, world, plugins, forbiddenActions, online: true, updatedAt: new Date() } }, { upsert: true });
+      networkCode, computedCode, world, plugins, forbiddenActions, travelEnabled, online: true, updatedAt: new Date() } }, { upsert: true });
     if (prior && prior.networkCode !== networkCode) {
       await this.gates.updateMany({ serverId, networkCode: prior.networkCode }, { $set: { networkCode } });
       await this.players.updateMany({ serverId, networkCode: prior.networkCode }, { $set: { networkCode } });
     }
-    this.sessions.set(serverId, { socket, serverId, networkCode });
-    this.send(socket, 'networkReady', msg.requestId, { networkCode, computedCode, changed: !!prior && prior.networkCode !== networkCode });
+    this.sessions.set(serverId, { socket, serverId, networkCode, host, port: port as number, travelEnabled,
+      dialSequenceVersion: p.dialSequenceVersion === 1 ? 1 : 0 });
+    this.send(socket, 'networkReady', msg.requestId, { networkCode, computedCode, dialSequenceVersion: 1, changed: !!prior && prior.networkCode !== networkCode });
     await this.replayTransfers(this.sessions.get(serverId)!);
   }
 
   private async registerGate(session: Session, msg: Message): Promise<void> {
-    const gateId = randomUUID().slice(0, 8).toUpperCase();
-    await this.gates.insertOne({ gateId, serverId: session.serverId, networkCode: session.networkCode, createdAt: new Date() });
-    this.send(session.socket, 'gateRegistered', msg.requestId, { gateId });
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const gateId = randomUUID().replace(/-/g, '').slice(0, 16).toUpperCase();
+      try {
+        await this.gates.insertOne({ gateId, serverId: session.serverId, networkCode: session.networkCode, createdAt: new Date() });
+        this.send(session.socket, 'gateRegistered', msg.requestId, { gateId });
+        return;
+      } catch (error) {
+        if (!(error instanceof MongoServerError) || error.code !== 11000) throw error;
+      }
+    }
+    throw new Error('gate_address_exhausted');
   }
 
   private async unregisterGate(session: Session, msg: Message): Promise<void> {
     const gateId = stringValue(msg.payload.gateId, 80);
+    if (!await this.gates.findOne({ gateId, serverId: session.serverId, networkCode: session.networkCode })) {
+      throw new Error('gate_not_owned_or_missing');
+    }
+    if (this.dialing.busy(gateId)) throw new Error('gate_busy');
     const result = await this.gates.deleteOne({ gateId, serverId: session.serverId, networkCode: session.networkCode });
     if (!result.deletedCount) throw new Error('gate_not_owned_or_missing');
     this.send(session.socket, 'gateUnregistered', msg.requestId, { gateId });
   }
 
   private async addressList(session: Session, msg: Message): Promise<void> {
-    const online = [...this.sessions.values()].filter(value => value.networkCode === session.networkCode).map(value => value.serverId);
+    if (!session.travelEnabled) throw new Error('network_disabled');
+    const online = [...this.sessions.values()].filter(value => value.travelEnabled && value.networkCode === session.networkCode).map(value => value.serverId);
     const rows = await this.gates.find({ networkCode: session.networkCode, serverId: { $in: online } }).project({ _id: 0, gateId: 1, serverId: 1 }).limit(256).toArray();
     this.send(session.socket, 'addressList', msg.requestId, { gates: rows });
   }
 
   private async dialGate(session: Session, msg: Message): Promise<void> {
+    if (!session.travelEnabled) throw new Error('network_disabled');
     const gateId = stringValue(msg.payload.gateId, 80);
     const originGateId = stringValue(msg.payload.originGateId, 80);
     const originGate = await this.gates.findOne({ gateId: originGateId, serverId: session.serverId, networkCode: session.networkCode });
     if (!originGate) throw new Error('origin_gate_not_owned');
-    const gate = await this.gates.findOne({ gateId, networkCode: session.networkCode });
-    if (!gate || gate.serverId === session.serverId) { this.send(session.socket, 'dialFail', msg.requestId, { reason: gate ? 'same_server' : 'gate_unavailable' }); return; }
-    const target = this.sessions.get(gate.serverId);
-    if (!target || target.networkCode !== session.networkCode) { this.send(session.socket, 'dialFail', msg.requestId, { reason: 'gate_offline' }); return; }
-    const dialId = randomUUID();
-    const timeout = setTimeout(() => {
-      this.pending.delete(dialId);
-      this.send(session.socket, 'dialFail', msg.requestId, { reason: 'timeout' });
-    }, REQUEST_TIMEOUT_MS);
-    this.pending.set(dialId, { origin: session, target, requestId: msg.requestId, gateId, originGateId, timeout });
-    this.send(target.socket, 'dialIn', dialId, { dialId, gateId, originGateId });
+    if (this.sessions.get(session.serverId) !== session) throw new Error('network_not_initialized');
+    if (session.dialSequenceVersion !== 1) throw new Error('dial_sequence_required');
+    this.dialing.start(session, originGateId, gateId, msg.requestId);
   }
 
   private async dialReply(session: Session, msg: Message): Promise<void> {
     const dialId = stringValue(msg.payload.dialId, 80);
-    const pending = this.pending.get(dialId);
-    if (!pending || pending.target !== session || pending.gateId !== msg.payload.gateId) throw new Error('unknown_dial');
-    clearTimeout(pending.timeout);
-    this.pending.delete(dialId);
-    if (msg.type === 'gateBlocked') { this.send(pending.origin.socket, 'gateBlocked', pending.requestId, { gateId: pending.gateId }); return; }
-    const server = await this.servers.findOne({ serverId: session.serverId });
-    if (!server) throw new Error('target_missing');
-    this.windows.set(`${pending.origin.serverId}:${pending.gateId}`, {
-      sourceServerId: pending.origin.serverId, targetServerId: session.serverId,
-      sourceGateId: pending.originGateId,
-      targetGateId: pending.gateId, expiresAt: Date.now() + TRANSFER_WINDOW_MS });
-    this.send(pending.origin.socket, 'gateFree', pending.requestId, { gateId: pending.gateId, host: server.host, port: server.port });
+    const gateId = stringValue(msg.payload.gateId, 80);
+    if (!this.dialing.reply(session, dialId, gateId, msg.type === 'gateFree')) throw new Error('unknown_dial');
   }
 
   private async updatePlayer(session: Session, msg: Message): Promise<void> {
@@ -252,7 +275,8 @@ export class StargateRelay {
       }
       throw error;
     }
-    this.windows.delete(`${session.serverId}:${targetGateId}`);
+    // A trip does not consume the wormhole. Its coordinator closes the window on
+    // expiry/disconnect; the durable per-player active-transfer index prevents duplicates.
     this.send(session.socket, 'transferQueued', msg.requestId, this.statusPayload(transfer));
     this.deliverIncoming(transfer);
   }
@@ -417,6 +441,7 @@ async function main(): Promise<void> {
   const heartbeat = setInterval(() => {
     for (const socket of ws.clients) if (socket.readyState === WebSocket.OPEN) socket.ping();
   }, 30_000);
+  const dialing = setInterval(() => void relay.tickDialing().catch(error => console.error('dial_tick_error', error)), 100);
   const expiry = setInterval(() => void relay.expireTransfers().catch(error => console.error('transfer_expiry_error', error)), 5_000);
   ws.on('connection', socket => {
     socket.on('message', data => void relay.receive(socket, data.toString()).catch(error => console.error('relay_receive_error', error)));
@@ -424,7 +449,7 @@ async function main(): Promise<void> {
   });
   const port = Number(process.env.PORT || 47016);
   server.listen(port, '0.0.0.0', () => console.log(`Stargate relay listening on ${port}`));
-  const shutdown = async () => { clearInterval(heartbeat); clearInterval(expiry); ws.close(); server.close(); await client.close(); };
+  const shutdown = async () => { clearInterval(heartbeat); clearInterval(dialing); clearInterval(expiry); ws.close(); server.close(); await client.close(); };
   process.once('SIGINT', () => void shutdown());
   process.once('SIGTERM', () => void shutdown());
 }
