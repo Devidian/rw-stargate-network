@@ -21,21 +21,21 @@ function fixture() {
 }
 
 async function run() {
-  { // Default cadence: no target contact before all seven 5-second steps.
+  { // Default cadence: each step fits the DHD, ring, and chevron reference clips.
     const events: Event[] = [];
     const dial = new DialCoordinator<DialPeer>(async () => ({ peer: b }),
       (peer, type, id, p) => events.push({ peer: peer.serverId, type, id, p }),
       () => assert.fail('must wait for target acknowledgement'), () => {});
     dial.start(a, 'A', 'B', 'default-cadence', 0);
     for (let step = 1; step <= 7; step++) {
-      await dial.tick(step * 5000 - 1);
+      await dial.tick(step * 7000 - 1);
       assert.equal(events.filter(e => e.type === 'dialProgress').length, step);
       assert.equal(events.some(e => e.type === 'dialIn'), false);
-      await dial.tick(step * 5000);
+      await dial.tick(step * 7000);
       assert.equal(events.filter(e => e.type === 'dialProgress').length, step + 1);
     }
     assert.equal(events.filter(e => e.type === 'dialIn').length, 1);
-    assert.ok(events.filter(e => e.type === 'dialProgress').every(e => e.p.stepMs === 5000));
+    assert.ok(events.filter(e => e.type === 'dialProgress').every(e => e.p.stepMs === 7000));
   }
   { // No early wormhole; seven steps, target acknowledgement, one open, expiry on both ends.
     const f = fixture(); f.coordinator.start(a, 'A', 'B', 'one');
@@ -44,7 +44,15 @@ async function run() {
     assert.deepEqual(f.events.filter(e => e.type === 'dialProgress').map(e => e.p.chevron), [0,1,2,3,4,5,6,7]);
     assert.equal(f.coordinator.reply(c, incoming.id, 'B', true), false);
     assert.equal(f.coordinator.reply(b, incoming.id, 'B', true), true);
-    assert.equal(f.coordinator.reply(b, incoming.id, 'B', true), false); assert.equal(f.opens, 1);
+    assert.equal(f.coordinator.reply(b, incoming.id, 'B', true), false); assert.equal(f.opens, 0);
+    assert.equal(f.events.some(e => e.peer === 'a' && e.type === 'gateState' && e.p.state === 'OPEN'), true);
+    assert.equal(f.events.some(e => e.peer === 'b' && e.type === 'gateState' && e.p.state === 'OPEN'), false);
+    assert.equal(f.events.some(e => e.type === 'gateFree' && e.peer === 'a'), false);
+    await f.advance(2799); assert.equal(f.opens, 0);
+    assert.equal(f.events.some(e => e.type === 'gateFree' && e.peer === 'a'), false);
+    await f.advance(1); assert.equal(f.opens, 1);
+    assert.equal(f.events.some(e => e.type === 'gateFree' && e.peer === 'a'), true);
+    assert.equal(f.events.some(e => e.peer === 'b' && e.type === 'gateState' && e.p.state === 'OPEN'), true);
     f.coordinator.start(a, 'A', 'C', 'busy');
     assert.ok(f.events.some(e => e.id === 'busy' && e.p.reason === 'source_busy'));
     await f.advance(60000); assert.equal(f.closes, 1); assert.equal(f.coordinator.busy('A'), false); assert.equal(f.coordinator.busy('B'), false);
@@ -55,7 +63,19 @@ async function run() {
     assert.ok(f.events.some(e => e.id === 'b-out' && e.p.reason === 'incoming_priority'));
     assert.equal(f.events.some(e => e.type === 'dialIn' && e.peer === 'a'), false);
     assert.equal(f.coordinator.reply(b, f.incoming().id, 'B', true), true);
-    await f.advance(60000); await f.steps(); assert.equal(f.opens, 1); assert.equal(f.coordinator.busy('B'), false);
+    await f.advance(2800); assert.equal(f.opens, 1);
+    await f.advance(60000); await f.steps(); assert.equal(f.coordinator.busy('B'), false);
+  }
+  { // Acceptance near the reply deadline still gets the full incoming sequence.
+    const f = fixture(); f.coordinator.start(a, 'A', 'B', 'late-accepted'); await f.steps();
+    const incoming = f.incoming();
+    await f.advance(9000);
+    assert.equal(f.coordinator.reply(b, incoming.id, 'B', true), true);
+    await f.advance(1000);
+    assert.equal(f.coordinator.busy('A'), true);
+    assert.equal(f.opens, 0);
+    await f.advance(1800);
+    assert.equal(f.opens, 1);
   }
   { // Exactly simultaneous crossed dials resolve to one connection.
     const f = fixture(); f.coordinator.start(a, 'A', 'B', 'a'); f.coordinator.start(b, 'B', 'A', 'b');

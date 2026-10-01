@@ -1,5 +1,11 @@
 # History
 
+## 0.3.0 — 2026-10-01
+
+- Extend the default seven-chevron outgoing cadence to seven seconds per lock for consecutive DHD, ring and chevron cues.
+- Open the source gate visually after target acceptance, activate the target's seven chevrons over 2.8 seconds, and create the travel window only when the target opens.
+- Keep the accepted connection reserved through its complete incoming animation, even when target acceptance arrives near the reply deadline. Preserve the 60-second travel window and transfer recovery protocol.
+
 ## 0.1.0 — 2026-09-26
 
 - First standalone Node 24 / MongoDB relay for OZ Stargate protocol v1.

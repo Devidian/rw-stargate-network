@@ -44,7 +44,7 @@ export class StargateRelay {
     }, connection => {
       const key = `${connection.source.serverId}:${connection.targetGate}`;
       if (this.windows.get(key)?.connectionId === connection.id) this.windows.delete(key);
-    }, duration('DIAL_STEP_MS', 5000, 5000), duration('GATE_OPEN_MS', 60000, 60000));
+    }, duration('DIAL_STEP_MS', 7000, 7000), duration('GATE_OPEN_MS', 60000, 60000));
   }
 
   async tickDialing(): Promise<void> { await this.dialing.tick(); }

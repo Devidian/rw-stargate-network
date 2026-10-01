@@ -4,17 +4,19 @@ export interface DialPeer { serverId: string; networkCode: string; host: string;
 type Attempt<P> = { kind: 'dial'; id: string; source: P; sourceGate: string; targetGate: string;
   requestId: string; step: number; nextStep: number; resolving: boolean };
 export type Connection<P> = { kind: 'connection'; id: string; source: P; target: P; sourceGate: string;
-  targetGate: string; requestId: string; open: boolean; expiresAt: number };
+  targetGate: string; requestId: string; open: boolean; acknowledged: boolean;
+  incomingUntil: number; expiresAt: number };
 type Resolution<P> = { peer: P } | { reason: string };
 
 /** One authoritative runtime per gate. No inventory or persistent transfer ownership lives here. */
 export class DialCoordinator<P extends DialPeer> {
+  private static readonly INCOMING_CHEVRON_MS = 400;
   private readonly gates = new Map<string, Attempt<P> | Connection<P>>();
   constructor(private readonly resolve: (source: P, gate: string) => Promise<Resolution<P>>,
     private readonly send: (peer: P, type: string, requestId: string, payload: Record<string, unknown>) => void,
     private readonly opened: (connection: Connection<P>) => void,
     private readonly closed: (connection: Connection<P>) => void,
-    private readonly stepMs = 5000, private readonly openMs = 60000, private readonly replyMs = 10000, private readonly now: () => number = Date.now) {}
+    private readonly stepMs = 7000, private readonly openMs = 60000, private readonly replyMs = 10000, private readonly now: () => number = Date.now) {}
 
   busy(gate: string): boolean { return this.gates.has(gate); }
 
@@ -33,7 +35,9 @@ export class DialCoordinator<P extends DialPeer> {
     const completing: Promise<void>[] = [];
     for (const state of new Set(this.gates.values())) {
       if (state.kind === 'connection') {
-        if (now >= state.expiresAt) this.end(state, state.open ? 'closed' : 'timeout');
+        if (state.acknowledged && !state.open) {
+          if (now >= state.incomingUntil) this.openConnection(state, now);
+        } else if (now >= state.expiresAt) this.end(state, state.open ? 'closed' : 'timeout');
       } else if (state.resolving && now >= state.nextStep) {
         this.fail(state, 'timeout');
       } else if (!state.resolving && now >= state.nextStep && this.gates.get(state.sourceGate) === state) {
@@ -63,7 +67,9 @@ export class DialCoordinator<P extends DialPeer> {
     if (occupied?.kind === 'dial') this.fail(occupied, 'incoming_priority');
     const connection: Connection<P> = { kind: 'connection', id: attempt.id, source: attempt.source,
       target: result.peer, sourceGate: attempt.sourceGate, targetGate: attempt.targetGate,
-      requestId: attempt.requestId, open: false, expiresAt: this.now() + this.replyMs };
+      requestId: attempt.requestId, open: false, acknowledged: false,
+      incomingUntil: 0,
+      expiresAt: this.now() + this.replyMs };
     this.gates.set(connection.sourceGate, connection);
     this.gates.set(connection.targetGate, connection);
     this.state(connection.target, connection.targetGate, 'INCOMING', connection.id, connection.sourceGate);
@@ -74,17 +80,25 @@ export class DialCoordinator<P extends DialPeer> {
   reply(peer: P, dialId: string, gateId: string, free: boolean, now = this.now()): boolean {
     const connection = this.gates.get(gateId);
     if (!connection || connection.kind !== 'connection' || connection.id !== dialId
-        || connection.target !== peer || connection.targetGate !== gateId || connection.open) return false;
+        || connection.target !== peer || connection.targetGate !== gateId || connection.open
+        || connection.acknowledged) return false;
     if (now >= connection.expiresAt) { this.end(connection, 'timeout'); return false; }
     if (!free) { this.end(connection, 'target_busy', 'gateBlocked'); return true; }
+    connection.acknowledged = true;
+    connection.incomingUntil = now + 7 * DialCoordinator.INCOMING_CHEVRON_MS;
+    this.state(connection.source, connection.sourceGate, 'OPEN', connection.id, connection.targetGate, 'OUTGOING');
+    return true;
+  }
+
+  private openConnection(connection: Connection<P>, now: number): void {
+    if (this.gates.get(connection.sourceGate) !== connection || connection.open) return;
     connection.open = true;
     connection.expiresAt = now + this.openMs;
     this.opened(connection);
-    this.state(connection.source, connection.sourceGate, 'OPEN', connection.id, connection.targetGate, 'OUTGOING');
     this.state(connection.target, connection.targetGate, 'OPEN', connection.id, connection.sourceGate, 'INCOMING');
-    this.send(connection.source, 'gateFree', connection.requestId, { gateId, sourceGateId: connection.sourceGate,
-      connectionId: connection.id, host: peer.host, port: peer.port, expiresInMs: this.openMs });
-    return true;
+    this.send(connection.source, 'gateFree', connection.requestId, { gateId: connection.targetGate,
+      sourceGateId: connection.sourceGate, connectionId: connection.id,
+      host: connection.target.host, port: connection.target.port, expiresInMs: this.openMs });
   }
 
   disconnect(peer: P): void {

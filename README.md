@@ -14,14 +14,14 @@ With a test MongoDB reachable through `MONGODB_URI`, run `node scripts/transfer-
 
 ## Docker release
 
-Use `devidian/rw-stargate-network:0.2.0` with the example Compose file after the 0.2.0 release is published. Copy the example to your own deployment directory and run `docker compose -f docker-compose.example.yml up -d`. Keep MongoDB on the private Compose network, persist its volume, and restrict TLS proxy access to your trusted game servers. No hosted public access is granted by installing this release.
+Use `devidian/rw-stargate-network:0.3.0` with the example Compose file. Copy the example to your own deployment directory and run `docker compose -f docker-compose.example.yml up -d`. Keep MongoDB on the private Compose network, persist its volume, and restrict TLS proxy access to your trusted game servers. No hosted public access is granted by installing this release.
 
 Back up MongoDB and every participating plugin/player database before upgrades. Stop new travel and resolve active transfers before rollback. Do not downgrade one side while transfers are in flight. Protocol v1 and the initial schemas are unchanged by the 0.1.0 packaging release.
 
 ## Development: phase 5A dialing
 
-See [dialing design and validation](docs/active/phase-5-dialing.md). The relay owns IDLE/OUTGOING/INCOMING/OPEN state, seven-chevron progress, incoming priority and connection expiry. Protocol v1 adds dialSequenceVersion=1 negotiation, dialProgress and gateState. Legacy clients cannot initiate or receive a new dial; existing transfer reconciliation is unchanged. Default DIAL_STEP_MS=5000 and GATE_OPEN_MS=60000; shorter values are for isolated tests. The final target reply deadline remains 10 seconds.
+See [dialing design and validation](docs/active/phase-5-dialing.md). The relay owns IDLE/OUTGOING/INCOMING/OPEN state, seven-chevron progress, incoming priority and connection expiry. Protocol v1 adds dialSequenceVersion=1 negotiation, dialProgress and gateState. Legacy clients cannot initiate or receive a new dial; existing transfer reconciliation is unchanged. Default DIAL_STEP_MS=7000 and GATE_OPEN_MS=60000; shorter values are for isolated tests. The target reply deadline remains 10 seconds; a successful reply opens the source gate immediately, then opens the target and permits travel after seven incoming chevrons at 400 ms each (2800 ms total).
 
 An open wormhole supports further trips until its original expiry or disconnect. Starting or declining one transfer does not consume that gate window. The unique active-transfer guard still allows only one outstanding trip per network/player; retries do not extend the wormhole lifetime.
 
-Dial progress includes optional `stepMs` for cosmetic client synchronization; older clients ignore it. Default seven-step duration is nominally 35 seconds.
+Dial progress includes optional `stepMs` for cosmetic client synchronization; older clients ignore it. Default seven-step duration is nominally 49 seconds, allowing the DHD, ring and chevron reference clips to play in sequence.

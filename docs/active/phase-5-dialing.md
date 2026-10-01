@@ -52,4 +52,16 @@ braking, pause and a complete inward/return stroke. `dialProgress.payload.stepMs
 additive optional duration hint, bounded by existing DIAL_STEP_MS validation (1..5000).
 Old plugins ignore it; current plugin uses 3500ms fallback with old relays. No v1 envelope,
 state/transfer semantics or persistence change. Tests assert the default deadline boundaries
-and emitted hint. The 60s plugin request timeout still covers the default + lookup/reply budgets.
+and emitted hint. The former 60s plugin request timeout covered that cadence; the audio cadence correction below extends it.
+
+## Audio cadence correction (2026-10-01)
+
+The seven-step default is now 7000 ms per symbol so the recorded DHD key (1131 ms), ring (3182/3090 ms) and outgoing chevron (2286 ms) can play consecutively. The protocol payload remains unchanged; `dialProgress.stepMs` reports the new cadence. The plugin dial request timeout is 90 seconds; the 60-second open interval and transfer logic are unchanged. Shorter overrides remain for isolated tests. Development player acceptance is pending.
+
+## Incoming activation before OPEN (2026-10-01)
+
+After the target accepts a remote dial, the relay keeps both gates reserved in INCOMING until seven 1321 ms chevron clips can play consecutively (9247 ms total). The 10-second target reply deadline applies only before acceptance; OPEN and its 60-second lifetime begin after activation. Timeout, refusal and disconnect still clear both gates. No protocol or database change. The matching plugin animates the target from the incoming timestamp and plays one cue per lit chevron. Development and Demo test servers use the private reference theme; production and public release remain untouched pending player acceptance.
+
+## Source-first opening and short target sequence (2026-10-01)
+
+Following player feedback, the source enters visible OPEN as soon as the target confirms availability. The target then plays seven incoming locks at 400 ms intervals and enters OPEN after 2800 ms. The relay creates the travel window and sends `gateFree` only at that boundary, so the source cannot transfer a player during the target sequence. OPEN expiry runs for 60 seconds from travel readiness. The plugin starts the target animation at `dialIn` acceptance and anchors each shutdown cue to the actual expiry. No new wire field or persistence change. The earlier 9247 ms note describes the previous Development test revision.

@@ -49,7 +49,7 @@ async function connect(serverId, override = 'transfer-smoke', travelEnabled = tr
     return new Promise((resolve, reject) => {
       const waiter = { predicate, resolve, timeout: setTimeout(() => {
         waiters.splice(waiters.indexOf(waiter), 1); reject(new Error('transfer response timeout'));
-      }, 10000) };
+      }, 15000) };
       waiters.push(waiter);
     });
   }, async request(type, payload) {
@@ -68,6 +68,11 @@ async function open(a, b, gateA, gateB) {
   a.send('dialGate', request, { gateId: gateB, originGateId: gateA });
   const incoming = await b.wait(value => value.type === 'dialIn');
   b.send('gateFree', randomUUID(), { gateId: gateB, dialId: incoming.payload.dialId });
+  await a.wait(value => value.type === 'gateState' && value.payload.gateId === gateA
+    && value.payload.connectionId === incoming.payload.dialId && value.payload.state === 'OPEN');
+  const early = await a.request('transferStart', { transferId: randomUUID(), uid: 'too-early',
+    sourceGateId: gateA, targetGateId: gateB, data });
+  assert.equal(early.payload.code, 'gate_not_open');
   assert.equal((await a.wait(value => value.requestId === request && value.type !== 'dialProgress')).type, 'gateFree');
 }
 
