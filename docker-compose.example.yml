@@ -1,6 +1,6 @@
 services:
   stargate-network:
-    image: devidian/rw-stargate-network:0.4.0
+    image: devidian/rw-stargate-network:0.4.1
     restart: unless-stopped
     environment:
       PORT: 47016

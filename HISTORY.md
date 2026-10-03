@@ -1,5 +1,10 @@
 # History
 
+## 0.4.1 — 2026-10-03
+
+- Document automatic relay access for game servers with arbitrary public IPs. The hosted TLS proxy no longer restricts `/ws` by client IP; network grouping still uses the computed or overridden code.
+- Ship a public nginx WebSocket proxy example with the release. Network codes remain routing metadata rather than authentication.
+
 ## 0.4.0 — 2026-10-03
 
 - Persist discovered gate addresses per network and player in the indexed MongoDB `address_books` collection. Repeated learning is idempotent; gate deletion removes addresses and notifies connected servers.

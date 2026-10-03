@@ -67,4 +67,6 @@ jobs:
           body_path: release-notes/${{ steps.version.outputs.version }}.md
           draft: false
           prerelease: false
-          files: docker-compose.example.yml
+          files: |
+            docker-compose.example.yml
+            examples/nginx-ws.conf
