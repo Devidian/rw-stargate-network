@@ -1,4 +1,5 @@
 import { DialCoordinator, type DialPeer } from './dial-coordinator.js';
+import { observedGameHost } from './observed-host.js';
 import { createServer } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { MongoClient, MongoServerError, type Collection } from 'mongodb';
@@ -7,6 +8,7 @@ import { canonicalCode, MAX_PAYLOAD, parseMessage, stringValue, TRANSFER_WINDOW_
 
 type ServerRecord = { serverId: string; name: string; host: string; port: number; networkCode: string; computedCode: string; world: WorldProfile; plugins: string[]; forbiddenActions: Record<string, boolean>; travelEnabled: boolean; online: boolean; updatedAt: Date };
 type GateRecord = { gateId: string; serverId: string; networkCode: string; createdAt: Date };
+type AddressBookRecord = { networkCode: string; uid: string; gateId: string; learnedAt: Date };
 type PlayerRecord = { uid: string; serverId: string; networkCode: string; name: string; playTimeSeconds: number; permissionGroup: string | null; updatedAt: Date };
 type Session = DialPeer & { socket: WebSocket; travelEnabled: boolean };
 type TransferState = 'PENDING' | 'ACCEPTED' | 'RELEASED' | 'CLAIMED' | 'DONE' | 'ABORTED';
@@ -17,10 +19,12 @@ type Window = { sourceServerId: string; targetServerId: string; sourceGateId: st
 
 export class StargateRelay {
   private readonly sessions = new Map<string, Session>();
+  private readonly observedHosts = new WeakMap<WebSocket, string>();
   private readonly dialing: DialCoordinator<Session>;
   private readonly windows = new Map<string, Window>();
   constructor(private readonly servers: Collection<ServerRecord>, private readonly gates: Collection<GateRecord>,
-    private readonly players: Collection<PlayerRecord>, private readonly transfers: Collection<TransferRecord>) {
+    private readonly players: Collection<PlayerRecord>, private readonly transfers: Collection<TransferRecord>,
+    private readonly addressBooks: Collection<AddressBookRecord>) {
     const duration = (key: string, fallback: number, max: number) => {
       const value = Number(process.env[key] ?? fallback);
       if (!Number.isInteger(value) || value < 10 || value > max) throw new Error(`invalid_${key}`);
@@ -55,6 +59,8 @@ export class StargateRelay {
       this.servers.createIndex({ networkCode: 1, online: 1 }),
       this.gates.createIndex({ gateId: 1 }, { unique: true }),
       this.gates.createIndex({ networkCode: 1, serverId: 1 }),
+      this.addressBooks.createIndex({ networkCode: 1, uid: 1, gateId: 1 }, { unique: true }),
+      this.addressBooks.createIndex({ networkCode: 1, gateId: 1 }),
       this.players.createIndex({ uid: 1, serverId: 1 }, { unique: true }),
       this.players.createIndex({ networkCode: 1, uid: 1 }),
       this.transfers.createIndex({ transferId: 1 }, { unique: true }),
@@ -83,6 +89,12 @@ export class StargateRelay {
     try { message = parseMessage(raw); }
     catch (error) { this.send(socket, 'error', 'invalid', { code: error instanceof Error ? error.message : 'invalid_message' }); return; }
     try {
+      if (message.type === 'resolveHost') {
+        const host = this.observedHosts.get(socket);
+        if (!host) throw new Error('host_detection_unavailable');
+        this.send(socket, 'hostResolved', message.requestId, { host });
+        return;
+      }
       if (message.type === 'initNetwork') { await this.initNetwork(socket, message); return; }
       const session = [...this.sessions.values()].find(candidate => candidate.socket === socket);
       if (!session || session.networkCode !== message.networkCode) throw new Error('network_not_initialized');
@@ -90,6 +102,7 @@ export class StargateRelay {
         case 'registerGate': await this.registerGate(session, message); break;
         case 'unregisterGate': await this.unregisterGate(session, message); break;
         case 'getAddressList': await this.addressList(session, message); break;
+        case 'syncAddressBook': await this.syncAddressBook(session, message); break;
         case 'dialGate': await this.dialGate(session, message); break;
         case 'gateFree': case 'gateBlocked': await this.dialReply(session, message); break;
         case 'updatePlayer': await this.updatePlayer(session, message); break;
@@ -106,6 +119,10 @@ export class StargateRelay {
     } catch (error) {
       this.send(socket, 'error', message.requestId, { code: error instanceof Error ? error.message : 'internal_error' });
     }
+  }
+
+  setObservedHost(socket: WebSocket, host: string | null): void {
+    if (host) this.observedHosts.set(socket, host);
   }
 
   private async initNetwork(socket: WebSocket, msg: Message): Promise<void> {
@@ -172,7 +189,31 @@ export class StargateRelay {
     if (this.dialing.busy(gateId)) throw new Error('gate_busy');
     const result = await this.gates.deleteOne({ gateId, serverId: session.serverId, networkCode: session.networkCode });
     if (!result.deletedCount) throw new Error('gate_not_owned_or_missing');
+    await this.addressBooks.deleteMany({ networkCode: session.networkCode, gateId });
     this.send(session.socket, 'gateUnregistered', msg.requestId, { gateId });
+    for (const peer of this.sessions.values()) if (peer.networkCode === session.networkCode)
+      this.send(peer.socket, 'addressRemoved', randomUUID(), { gateId });
+  }
+
+  private async syncAddressBook(session: Session, msg: Message): Promise<void> {
+    const uid = stringValue(msg.payload.uid, 128);
+    if (!/^[A-Za-z0-9_-]+$/.test(uid)) throw new Error('invalid_uid');
+    const pending = msg.payload.pending;
+    if (!Array.isArray(pending) || pending.length > 256) throw new Error('invalid_pending_addresses');
+    for (const raw of new Set(pending)) {
+      const gateId = stringValue(raw, 16);
+      if (!/^[A-Z0-9]{16}$/.test(gateId)) throw new Error('invalid_gate_address');
+      if (!await this.gates.findOne({ networkCode: session.networkCode, gateId })) continue;
+      await this.addressBooks.updateOne({ networkCode: session.networkCode, uid, gateId },
+        { $setOnInsert: { networkCode: session.networkCode, uid, gateId, learnedAt: new Date() } }, { upsert: true });
+    }
+    const rows = await this.addressBooks.find({ networkCode: session.networkCode, uid })
+      .project({ _id: 0, gateId: 1 }).sort({ gateId: 1 }).toArray();
+    const existing = new Set((await this.gates.find({ networkCode: session.networkCode,
+      gateId: { $in: rows.map(row => row.gateId) } }).project({ _id: 0, gateId: 1 }).toArray()).map(row => row.gateId));
+    const stale = rows.filter(row => !existing.has(row.gateId)).map(row => row.gateId);
+    if (stale.length) await this.addressBooks.deleteMany({ networkCode: session.networkCode, uid, gateId: { $in: stale } });
+    this.send(session.socket, 'addressBook', msg.requestId, { uid, gates: rows.map(row => row.gateId).filter(id => existing.has(id)) });
   }
 
   private async addressList(session: Session, msg: Message): Promise<void> {
@@ -430,7 +471,8 @@ async function main(): Promise<void> {
   await client.connect();
   const db = client.db(process.env.MONGODB_DATABASE || 'rw_stargate_network');
   const relay = new StargateRelay(db.collection<ServerRecord>('servers'), db.collection<GateRecord>('gates'),
-    db.collection<PlayerRecord>('players'), db.collection<TransferRecord>('transfers'));
+    db.collection<PlayerRecord>('players'), db.collection<TransferRecord>('transfers'),
+    db.collection<AddressBookRecord>('address_books'));
   await relay.initialize();
   const server = createServer((req, res) => {
     if (req.url === '/health') { res.writeHead(200); res.end('ok'); return; }
@@ -443,7 +485,9 @@ async function main(): Promise<void> {
   }, 30_000);
   const dialing = setInterval(() => void relay.tickDialing().catch(error => console.error('dial_tick_error', error)), 100);
   const expiry = setInterval(() => void relay.expireTransfers().catch(error => console.error('transfer_expiry_error', error)), 5_000);
-  ws.on('connection', socket => {
+  ws.on('connection', (socket, request) => {
+    const realIp = typeof request.headers['x-real-ip'] === 'string' ? request.headers['x-real-ip'] : undefined;
+    relay.setObservedHost(socket, observedGameHost(realIp, process.env.LOCAL_GAME_PUBLIC_IP));
     socket.on('message', data => void relay.receive(socket, data.toString()).catch(error => console.error('relay_receive_error', error)));
     socket.on('close', () => void relay.disconnect(socket).catch(error => console.error('relay_disconnect_error', error)));
   });

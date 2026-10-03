@@ -1,5 +1,11 @@
 # History
 
+## 0.4.0 — 2026-10-03
+
+- Persist discovered gate addresses per network and player in the indexed MongoDB `address_books` collection. Repeated learning is idempotent; gate deletion removes addresses and notifies connected servers.
+- Resolve an unconfigured game host from the proxy-observed address, with an explicit local Docker fallback. Keep the supplied proxy header and network code as routing information, not authentication.
+- Preserve protocol v1 and existing gate and transfer records. Existing address books start empty.
+
 ## 0.3.0 — 2026-10-01
 
 - Extend the default seven-chevron outgoing cadence to seven seconds per lock for consecutive DHD, ring and chevron cues.

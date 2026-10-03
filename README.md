@@ -2,9 +2,28 @@
 
 WebSocket/MongoDB relay for OZ Stargate. Requires Node 24, Yarn 4.15, and MongoDB. Its HTTP `/health` endpoint and WebSocket `/ws` endpoint listen on port 47016 by default.
 
+When a plugin has no configured advertised host, it sends `resolveHost` before
+`initNetwork`. The relay replies with the public IPv4 from the proxy's
+`X-Real-IP` header. The TLS proxy must overwrite this header with its actual
+client address. For game servers on the relay's own Docker network, set
+`LOCAL_GAME_PUBLIC_IP` to their shared public host IP; this fallback applies
+only to clients seen on `172.20.0.0/16`. If neither yields a public IPv4, the
+plugin asks the admin to enter a reachable host manually. The resolved address
+is routing information, not proof that the game port is reachable.
+
 Each server identifies itself by a stable UUID derived from its configured `relay.advertisedHost`, game port, and world name; the game API server UID was not ready at plugin startup. `initNetwork` computes a deterministic 24-character SHA-256 prefix from five world settings, the sorted plugin name/version list, and sorted `forbiddenActions` boolean flags. An optional `networkCode.override` groups test servers manually. The returned `networkCode.trusted` is recorded by the plugin. This code is routing metadata, **not authentication**: run only in a controlled Development environment until authenticated server identities and abuse protection are implemented.
 
 Protocol v1 uses JSON envelopes: `{ "v": 1, "type": "...", "requestId": "...", "networkCode": "...", "payload": {} }`. `initNetwork` omits `networkCode`; subsequent client events include the relay-returned code. Replies carry the same `requestId`, except `dialIn`, which uses a relay-generated `dialId`. Commands: `initNetwork` → `networkReady`; `registerGate` → `gateRegistered`; `unregisterGate` → `gateUnregistered`; `getAddressList` → `addressList`; `dialGate` → `dialFail` or a `dialIn` to the target; target `gateBlocked` or `gateFree` → origin response. Phase 3A adds `updatePlayer` → `playerUpdated` and `playerTrust` → `playerTrust`. Player records contain UID, name, world play time, permission group, server ID, and update time; they do not transfer player data or assign a trust score. The target has ten seconds to answer a dial. The relay sends WebSocket ping frames every 30 seconds to keep idle proxy connections alive. Gates are visible only while their owner server is connected. Server, gate, and player-observation data survive relay restarts in MongoDB; online state is reset on startup.
+
+The discovery address book uses `syncAddressBook` with `{uid,pending:[gateId...]}`
+and replies `addressBook` with the complete known ID list for that network and
+UID. Learning is idempotent and only existing gates are accepted. The MongoDB
+`address_books` collection has a unique `(networkCode,uid,gateId)` index.
+Unregistering a gate deletes every matching book entry and sends
+`addressRemoved` to connected servers. A reconnecting plugin submits pending
+discoveries before replacing its local cache with the relay snapshot. The
+legacy `getAddressList` command remains for older clients; new plugin UI and
+player commands use only discovered addresses.
 
 Run `yarn install && yarn test`, then set `MONGODB_URI` and `yarn start`. `docker-compose.example.yml` illustrates an isolated MongoDB and a loopback-only port for a TLS proxy. Expose only `/ws` through TLS. The experimental protocol must not be made available as a public trusted transfer service.
 
@@ -14,7 +33,7 @@ With a test MongoDB reachable through `MONGODB_URI`, run `node scripts/transfer-
 
 ## Docker release
 
-Use `devidian/rw-stargate-network:0.3.0` with the example Compose file. Copy the example to your own deployment directory and run `docker compose -f docker-compose.example.yml up -d`. Keep MongoDB on the private Compose network, persist its volume, and restrict TLS proxy access to your trusted game servers. No hosted public access is granted by installing this release.
+Use `devidian/rw-stargate-network:0.4.0` with the example Compose file. Copy the example to your own deployment directory and run `docker compose -f docker-compose.example.yml up -d`. Keep MongoDB on the private Compose network, persist its volume, and restrict TLS proxy access to your trusted game servers. No hosted public access is granted by installing this release.
 
 Back up MongoDB and every participating plugin/player database before upgrades. Stop new travel and resolve active transfers before rollback. Do not downgrade one side while transfers are in flight. Protocol v1 and the initial schemas are unchanged by the 0.1.0 packaging release.
 

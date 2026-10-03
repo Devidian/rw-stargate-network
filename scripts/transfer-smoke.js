@@ -101,6 +101,16 @@ async function run() {
     const gateA = (await a.request('registerGate', {})).payload.gateId;
     const gateB = (await b.request('registerGate', {})).payload.gateId;
     assert.match(gateA, /^[0-9A-F]{16}$/);
+    assert.deepEqual((await a.request('syncAddressBook', { uid: 'book-player', pending: [] })).payload.gates, []);
+    assert.deepEqual((await a.request('syncAddressBook', { uid: 'book-player', pending: [gateB, gateB] })).payload.gates, [gateB]);
+    assert.deepEqual((await b.request('syncAddressBook', { uid: 'book-player', pending: [] })).payload.gates, [gateB]);
+    assert.deepEqual((await b.request('syncAddressBook', { uid: 'other-player', pending: [] })).payload.gates, []);
+    const disposableGate = (await b.request('registerGate', {})).payload.gateId;
+    assert.deepEqual((await a.request('syncAddressBook', { uid: 'book-player', pending: [disposableGate] })).payload.gates.sort(),
+      [gateB, disposableGate].sort());
+    assert.equal((await b.request('unregisterGate', { gateId: disposableGate })).type, 'gateUnregistered');
+    assert.equal((await a.wait(value => value.type === 'addressRemoved' && value.payload.gateId === disposableGate)).type, 'addressRemoved');
+    assert.deepEqual((await a.request('syncAddressBook', { uid: 'book-player', pending: [disposableGate] })).payload.gates, [gateB]);
     const localOnly = await connect('local-only', 'transfer-smoke', false);
     const localGate = (await localOnly.request('registerGate', {})).payload.gateId;
     assert.match(localGate, /^[0-9A-F]{16}$/);
