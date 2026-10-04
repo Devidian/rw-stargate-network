@@ -7,7 +7,7 @@ import WebSocket, { WebSocketServer } from 'ws';
 import { canonicalCode, MAX_PAYLOAD, parseMessage, stringValue, TRANSFER_WINDOW_MS, type Message, type WorldProfile, WORLD_KEYS } from './protocol.js';
 
 type ServerRecord = { serverId: string; name: string; host: string; port: number; networkCode: string; computedCode: string; world: WorldProfile; plugins: string[]; forbiddenActions: Record<string, boolean>; travelEnabled: boolean; online: boolean; updatedAt: Date };
-type GateRecord = { gateId: string; serverId: string; networkCode: string; createdAt: Date };
+type GateRecord = { gateId: string; serverId: string; networkCode: string; address?: string; localAddress?: string; alias?: string; createdAt: Date };
 type AddressBookRecord = { networkCode: string; uid: string; gateId: string; learnedAt: Date };
 type PlayerRecord = { uid: string; serverId: string; networkCode: string; name: string; playTimeSeconds: number; permissionGroup: string | null; updatedAt: Date };
 type Session = DialPeer & { socket: WebSocket; travelEnabled: boolean };
@@ -58,6 +58,10 @@ export class StargateRelay {
       this.servers.createIndex({ serverId: 1 }, { unique: true }),
       this.servers.createIndex({ networkCode: 1, online: 1 }),
       this.gates.createIndex({ gateId: 1 }, { unique: true }),
+      this.gates.createIndex({ networkCode: 1, address: 1 }, { unique: true,
+        partialFilterExpression: { address: { $type: 'string' } } }),
+      this.gates.createIndex({ networkCode: 1, localAddress: 1 }, { unique: true,
+        partialFilterExpression: { localAddress: { $type: 'string' } } }),
       this.gates.createIndex({ networkCode: 1, serverId: 1 }),
       this.addressBooks.createIndex({ networkCode: 1, uid: 1, gateId: 1 }, { unique: true }),
       this.addressBooks.createIndex({ networkCode: 1, gateId: 1 }),
@@ -100,6 +104,8 @@ export class StargateRelay {
       if (!session || session.networkCode !== message.networkCode) throw new Error('network_not_initialized');
       switch (message.type) {
         case 'registerGate': await this.registerGate(session, message); break;
+        case 'setGateLocalAddress': await this.setGateLocalAddress(session, message); break;
+        case 'setGateAlias': await this.setGateAlias(session, message); break;
         case 'unregisterGate': await this.unregisterGate(session, message); break;
         case 'getAddressList': await this.addressList(session, message); break;
         case 'syncAddressBook': await this.syncAddressBook(session, message); break;
@@ -168,17 +174,65 @@ export class StargateRelay {
   }
 
   private async registerGate(session: Session, msg: Message): Promise<void> {
+    const requested = msg.payload.gateId;
+    if (requested !== undefined && (typeof requested !== 'string' || !/^LOCAL[0-9A-F]{11}$/.test(requested))) {
+      throw new Error('invalid_gate_address');
+    }
+    if (typeof requested === 'string') {
+      const existing = await this.gates.findOne({ gateId: requested });
+      if (existing) {
+        if (existing.serverId !== session.serverId || existing.networkCode !== session.networkCode) throw new Error('gate_not_owned_or_missing');
+        if (!existing.localAddress) await this.gates.updateOne({ gateId: requested, serverId: session.serverId },
+          { $set: { localAddress: requested } });
+        let address = existing.address;
+        if (!address) {
+          for (let attempt = 0; attempt < 5 && !address; attempt++) {
+            const candidate = randomUUID().replace(/-/g, '').slice(0, 16).toUpperCase();
+            if (await this.gates.findOne({ networkCode: session.networkCode,
+              $or: [{ gateId: candidate }, { address: candidate }] })) continue;
+            try {
+              await this.gates.updateOne({ gateId: requested, serverId: session.serverId, address: { $exists: false } },
+                { $set: { address: candidate } });
+              address = (await this.gates.findOne({ gateId: requested }))?.address;
+            } catch (error) {
+              if (!(error instanceof MongoServerError) || error.code !== 11000) throw error;
+            }
+          }
+          if (!address) throw new Error('gate_address_exhausted');
+        }
+        this.send(session.socket, 'gateRegistered', msg.requestId, { gateId: requested, address });
+        return;
+      }
+    }
     for (let attempt = 0; attempt < 5; attempt++) {
-      const gateId = randomUUID().replace(/-/g, '').slice(0, 16).toUpperCase();
+      const gateId = typeof requested === 'string' ? requested : randomUUID().replace(/-/g, '').slice(0, 16).toUpperCase();
+      const address = typeof requested === 'string' ? randomUUID().replace(/-/g, '').slice(0, 16).toUpperCase() : gateId;
+      if (await this.gates.findOne({ networkCode: session.networkCode,
+        $or: [{ gateId: address }, { address }] })) continue;
       try {
-        await this.gates.insertOne({ gateId, serverId: session.serverId, networkCode: session.networkCode, createdAt: new Date() });
-        this.send(session.socket, 'gateRegistered', msg.requestId, { gateId });
+        await this.gates.insertOne({ gateId, address, localAddress: typeof requested === 'string' ? requested : undefined,
+          serverId: session.serverId, networkCode: session.networkCode, createdAt: new Date() });
+        this.send(session.socket, 'gateRegistered', msg.requestId, { gateId, address });
         return;
       } catch (error) {
         if (!(error instanceof MongoServerError) || error.code !== 11000) throw error;
       }
     }
     throw new Error('gate_address_exhausted');
+  }
+
+  private async setGateLocalAddress(session: Session, msg: Message): Promise<void> {
+    const gateId = stringValue(msg.payload.gateId, 80);
+    const localAddress = stringValue(msg.payload.localAddress, 16);
+    if (!/^LOCAL[0-9A-F]{11}$/.test(localAddress)) throw new Error('invalid_gate_address');
+    const gate = await this.gates.findOne({ gateId, serverId: session.serverId, networkCode: session.networkCode });
+    if (!gate) throw new Error('gate_not_owned_or_missing');
+    const collision = await this.gates.findOne({ networkCode: session.networkCode,
+      $or: [{ gateId: localAddress }, { localAddress }] });
+    if (collision && collision.gateId !== gateId) throw new Error('gate_address_conflict');
+    await this.gates.updateOne({ gateId, serverId: session.serverId, networkCode: session.networkCode },
+      { $set: { localAddress } });
+    this.send(session.socket, 'gateLocalAddressSet', msg.requestId, { gateId, localAddress });
   }
 
   private async unregisterGate(session: Session, msg: Message): Promise<void> {
@@ -193,6 +247,19 @@ export class StargateRelay {
     this.send(session.socket, 'gateUnregistered', msg.requestId, { gateId });
     for (const peer of this.sessions.values()) if (peer.networkCode === session.networkCode)
       this.send(peer.socket, 'addressRemoved', randomUUID(), { gateId });
+  }
+
+  private async setGateAlias(session: Session, msg: Message): Promise<void> {
+    const gateId = stringValue(msg.payload.gateId, 16);
+    if (!/^[A-Z0-9]{16}$/.test(gateId)) throw new Error('invalid_gate_address');
+    const alias = msg.payload.alias;
+    if (typeof alias !== 'string' || (alias !== '' && !/^[\p{L}\p{N} _.'-]{1,40}$/u.test(alias))) {
+      throw new Error('invalid_gate_alias');
+    }
+    const result = await this.gates.updateOne({ gateId, serverId: session.serverId, networkCode: session.networkCode },
+      alias === '' ? { $unset: { alias: '' } } : { $set: { alias } });
+    if (!result.matchedCount) throw new Error('gate_not_owned_or_missing');
+    this.send(session.socket, 'gateAliasSet', msg.requestId, { gateId, alias });
   }
 
   private async syncAddressBook(session: Session, msg: Message): Promise<void> {
@@ -213,7 +280,14 @@ export class StargateRelay {
       gateId: { $in: rows.map(row => row.gateId) } }).project({ _id: 0, gateId: 1 }).toArray()).map(row => row.gateId));
     const stale = rows.filter(row => !existing.has(row.gateId)).map(row => row.gateId);
     if (stale.length) await this.addressBooks.deleteMany({ networkCode: session.networkCode, uid, gateId: { $in: stale } });
-    this.send(session.socket, 'addressBook', msg.requestId, { uid, gates: rows.map(row => row.gateId).filter(id => existing.has(id)) });
+    const details = await this.gates.find({ networkCode: session.networkCode,
+      gateId: { $in: rows.map(row => row.gateId).filter(id => existing.has(id)) } })
+      .project({ _id: 0, gateId: 1, address: 1, localAddress: 1, alias: 1 }).toArray();
+    this.send(session.socket, 'addressBook', msg.requestId, { uid,
+      gates: rows.map(row => row.gateId).filter(id => existing.has(id)),
+      details: details.map(gate => ({ gateId: gate.gateId, address: gate.address ?? gate.gateId,
+        localAddress: gate.localAddress ?? (gate.gateId.startsWith('LOCAL') ? gate.gateId : null),
+        alias: gate.alias ?? '' })) });
   }
 
   private async addressList(session: Session, msg: Message): Promise<void> {
@@ -225,13 +299,15 @@ export class StargateRelay {
 
   private async dialGate(session: Session, msg: Message): Promise<void> {
     if (!session.travelEnabled) throw new Error('network_disabled');
-    const gateId = stringValue(msg.payload.gateId, 80);
+    const address = stringValue(msg.payload.gateId, 80);
     const originGateId = stringValue(msg.payload.originGateId, 80);
     const originGate = await this.gates.findOne({ gateId: originGateId, serverId: session.serverId, networkCode: session.networkCode });
     if (!originGate) throw new Error('origin_gate_not_owned');
     if (this.sessions.get(session.serverId) !== session) throw new Error('network_not_initialized');
     if (session.dialSequenceVersion !== 1) throw new Error('dial_sequence_required');
-    this.dialing.start(session, originGateId, gateId, msg.requestId);
+    const target = await this.gates.findOne({ networkCode: session.networkCode,
+      $or: [{ gateId: address }, { address }] });
+    this.dialing.start(session, originGateId, target?.gateId ?? address, msg.requestId);
   }
 
   private async dialReply(session: Session, msg: Message): Promise<void> {

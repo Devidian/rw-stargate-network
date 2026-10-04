@@ -101,6 +101,48 @@ async function run() {
     const gateA = (await a.request('registerGate', {})).payload.gateId;
     const gateB = (await b.request('registerGate', {})).payload.gateId;
     assert.match(gateA, /^[0-9A-F]{16}$/);
+    const localGateId = `LOCAL${randomUUID().replaceAll('-', '').slice(0, 11).toUpperCase()}`;
+    const localRegistration = await a.request('registerGate', { gateId: localGateId });
+    assert.equal(localRegistration.type, 'gateRegistered');
+    assert.equal(localRegistration.payload.gateId, localGateId);
+    assert.match(localRegistration.payload.address, /^[0-9A-F]{16}$/);
+    assert.notEqual(localRegistration.payload.address, localGateId);
+    assert.equal((await a.request('registerGate', { gateId: localGateId })).payload.address,
+      localRegistration.payload.address);
+    const legacyLocalAddress = `LOCAL${randomUUID().replaceAll('-', '').slice(0, 11).toUpperCase()}`;
+    assert.equal((await a.request('setGateLocalAddress', { gateId: gateA,
+      localAddress: legacyLocalAddress })).type, 'gateLocalAddressSet');
+    assert.equal((await b.request('setGateLocalAddress', { gateId: gateA,
+      localAddress: legacyLocalAddress })).payload.code, 'gate_not_owned_or_missing');
+    const legacyBook = await b.request('syncAddressBook', { uid: 'legacy-gate-player', pending: [gateA] });
+    assert.equal(legacyBook.payload.details[0].localAddress, legacyLocalAddress);
+    await mongo.db(databaseName).collection('gates').updateOne({ gateId: localGateId }, { $unset: { address: '' } });
+    const migratedAddress = (await a.request('registerGate', { gateId: localGateId })).payload.address;
+    assert.match(migratedAddress, /^[0-9A-F]{16}$/);
+    assert.notEqual(migratedAddress, localGateId);
+    assert.equal((await a.request('setGateAlias', { gateId: localGateId, alias: 'Alpha Gate' })).type, 'gateAliasSet');
+    assert.equal((await b.request('setGateAlias', { gateId: localGateId, alias: 'Wrong Owner' })).payload.code,
+      'gate_not_owned_or_missing');
+    const localBook = await b.request('syncAddressBook', { uid: 'local-gate-player', pending: [localGateId] });
+    assert.deepEqual(localBook.payload.gates, [localGateId]);
+    assert.deepEqual(localBook.payload.details, [{ gateId: localGateId,
+      address: migratedAddress, localAddress: localGateId, alias: 'Alpha Gate' }]);
+    const globalDialId = randomUUID();
+    b.send('dialGate', globalDialId, { gateId: migratedAddress, originGateId: gateB });
+    const localIncoming = await a.wait(value => value.type === 'dialIn' && value.payload.gateId === localGateId);
+    a.send('gateFree', randomUUID(), { gateId: localGateId, dialId: localIncoming.payload.dialId });
+    const globalDial = await b.wait(value => value.requestId === globalDialId && value.type === 'gateFree');
+    assert.equal(globalDial.payload.gateId, localGateId);
+    const localTransferId = randomUUID();
+    assert.equal((await b.request('transferStart', { transferId: localTransferId, uid: 'local-gate-player',
+      sourceGateId: gateB, targetGateId: localGateId, data })).type, 'transferQueued');
+    assert.equal((await a.wait(value => value.type === 'incomingTransfer'
+      && value.payload.transferId === localTransferId)).payload.targetGateId, localGateId);
+    assert.equal((await b.request('transferAbort', { transferId: localTransferId })).payload.state, 'ABORTED');
+    await new Promise(resolve => setTimeout(resolve, 1200));
+    assert.equal((await a.request('unregisterGate', { gateId: localGateId })).type, 'gateUnregistered');
+    await b.wait(value => value.type === 'addressRemoved' && value.payload.gateId === localGateId);
+    assert.deepEqual((await b.request('syncAddressBook', { uid: 'local-gate-player', pending: [] })).payload.gates, []);
     assert.deepEqual((await a.request('syncAddressBook', { uid: 'book-player', pending: [] })).payload.gates, []);
     assert.deepEqual((await a.request('syncAddressBook', { uid: 'book-player', pending: [gateB, gateB] })).payload.gates, [gateB]);
     assert.deepEqual((await b.request('syncAddressBook', { uid: 'book-player', pending: [] })).payload.gates, [gateB]);

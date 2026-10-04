@@ -33,9 +33,9 @@ With a test MongoDB reachable through `MONGODB_URI`, run `node scripts/transfer-
 
 ## Docker release
 
-Use `devidian/rw-stargate-network:0.4.1` with the example Compose file. Copy the example to your own deployment directory and run `docker compose -f docker-compose.example.yml up -d`. Keep MongoDB on the private Compose network and persist its volume. The hosted `/ws` proxy was opened to arbitrary client IPs on 2026-10-03; installing this image alone does not configure a public proxy.
+Use `devidian/rw-stargate-network:0.5.0` with the example Compose file. Copy the example to your own deployment directory and run `docker compose -f docker-compose.example.yml up -d`. Keep MongoDB on the private Compose network and persist its volume. An existing MongoDB can also be used through `MONGODB_URI` and a dedicated `MONGODB_DATABASE`; a second MongoDB container is unnecessary. Installing this image alone does not configure a public proxy.
 
-Back up MongoDB and every participating plugin/player database before upgrades. Stop new travel and resolve active transfers before rollback. Do not downgrade one side while transfers are in flight. Protocol v1 and the initial schemas are unchanged by the 0.1.0 packaging release.
+Back up MongoDB and every participating plugin/player database before upgrades. Stop new travel and resolve active transfers before rollback. Upgrade the relay before OZ Stargate 0.5.0; do not downgrade one side while transfers are in flight. Protocol v1 remains in use. The relay adds optional gate address and alias fields and unique indexes; existing gate and transfer records remain readable.
 
 ## Development: phase 5A dialing
 
