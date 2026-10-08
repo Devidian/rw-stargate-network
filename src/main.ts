@@ -161,12 +161,24 @@ export class StargateRelay {
       active.socket.close(4001, 'replaced by server reconnect');
     }
     const prior = await this.servers.findOne({ serverId });
-    await this.servers.updateOne({ serverId }, { $set: { serverId, name, host, port: port as number,
-      networkCode, computedCode, world, plugins, forbiddenActions, travelEnabled, online: true, updatedAt: new Date() } }, { upsert: true });
     if (prior && prior.networkCode !== networkCode) {
+      const owned = await this.gates.find({ serverId, networkCode: { $in: [prior.networkCode, networkCode] } }).toArray();
+      const gateIds = owned.map(gate => gate.gateId);
+      for (const gate of owned) {
+        if (gate.address && await this.gates.findOne({ networkCode, address: gate.address, gateId: { $ne: gate.gateId } })) throw new Error('network_address_collision');
+        if (gate.localAddress && await this.gates.findOne({ networkCode, localAddress: gate.localAddress, gateId: { $ne: gate.gateId } })) throw new Error('local_address_collision');
+      }
+      if (gateIds.length) {
+        const learned = await this.addressBooks.find({ networkCode: prior.networkCode, gateId: { $in: gateIds } }).toArray();
+        for (const row of learned) await this.addressBooks.updateOne({ networkCode, uid: row.uid, gateId: row.gateId },
+          { $setOnInsert: { networkCode, uid: row.uid, gateId: row.gateId, learnedAt: row.learnedAt } }, { upsert: true });
+      }
       await this.gates.updateMany({ serverId, networkCode: prior.networkCode }, { $set: { networkCode } });
       await this.players.updateMany({ serverId, networkCode: prior.networkCode }, { $set: { networkCode } });
+      if (gateIds.length) await this.addressBooks.deleteMany({ networkCode: prior.networkCode, gateId: { $in: gateIds } });
     }
+    await this.servers.updateOne({ serverId }, { $set: { serverId, name, host, port: port as number,
+      networkCode, computedCode, world, plugins, forbiddenActions, travelEnabled, online: true, updatedAt: new Date() } }, { upsert: true });
     this.sessions.set(serverId, { socket, serverId, networkCode, host, port: port as number, travelEnabled,
       dialSequenceVersion: p.dialSequenceVersion === 1 ? 1 : 0 });
     this.send(socket, 'networkReady', msg.requestId, { networkCode, computedCode, dialSequenceVersion: 1, changed: !!prior && prior.networkCode !== networkCode });

@@ -25,6 +25,8 @@ discoveries before replacing its local cache with the relay snapshot. The
 legacy `getAddressList` command remains for older clients; new plugin UI and
 player commands use only discovered addresses.
 
+On a server network-code change, the relay moves only that server's gate records and their address-book entries to the new code. Entries belonging to other servers remain under the old code. The operation is retryable after an interruption; it checks destination-address collisions before moving records.
+
 Run `yarn install && yarn test`, then set `MONGODB_URI` and `yarn start`. `docker-compose.example.yml` illustrates an isolated MongoDB and a loopback-only port for a TLS proxy. `examples/nginx-ws.conf` shows the public WebSocket location and the required proxy-owned `X-Real-IP` header. Expose only `/ws` through TLS. The endpoint may accept arbitrary server IPs, but the experimental protocol must not be presented as an authenticated or trusted transfer service.
 
 Phase 3B uses `transferStart`, target `transferAccepted`, source `transferReleased`, target `transferClaim`, and `transferDone`. Persisted states are `PENDING → ACCEPTED → RELEASED → CLAIMED → DONE`; only the first three states may become `ABORTED`. A unique partial index prevents multiple active transfers for the same network/player. The relay accepts a transfer only through an unexpired dial window. Its one-minute transfer deadline can abort unclaimed transfers; a claimed transfer remains blocked until target completion. `transferStatus` and reconnect replay reconcile durable state. Terminal records retain metadata while their binary payload is removed. Messages are bounded at 1 MiB and inventory/clothes base64 fields at 650,000 characters each.
@@ -33,9 +35,9 @@ With a test MongoDB reachable through `MONGODB_URI`, run `node scripts/transfer-
 
 ## Docker release
 
-Use `devidian/rw-stargate-network:0.5.0` with the example Compose file. Copy the example to your own deployment directory and run `docker compose -f docker-compose.example.yml up -d`. Keep MongoDB on the private Compose network and persist its volume. An existing MongoDB can also be used through `MONGODB_URI` and a dedicated `MONGODB_DATABASE`; a second MongoDB container is unnecessary. Installing this image alone does not configure a public proxy.
+Use `devidian/rw-stargate-network:0.5.1` with the example Compose file. Copy the example to your own deployment directory and run `docker compose -f docker-compose.example.yml up -d`. Keep MongoDB on the private Compose network and persist its volume. An existing MongoDB can also be used through `MONGODB_URI` and a dedicated `MONGODB_DATABASE`; a second MongoDB container is unnecessary. Installing this image alone does not configure a public proxy.
 
-Back up MongoDB and every participating plugin/player database before upgrades. Stop new travel and resolve active transfers before rollback. Upgrade the relay before OZ Stargate 0.5.0; do not downgrade one side while transfers are in flight. Protocol v1 remains in use. The relay adds optional gate address and alias fields and unique indexes; existing gate and transfer records remain readable.
+Back up MongoDB and every participating plugin/player database before upgrades. Stop new travel and resolve active transfers before rollback. Upgrade the relay before OZ Stargate 0.6.0; do not downgrade one side while transfers are in flight. Protocol v1 remains in use. The relay adds optional gate address and alias fields and unique indexes; existing gate and transfer records remain readable.
 
 ## Development: phase 5A dialing
 

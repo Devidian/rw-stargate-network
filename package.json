@@ -1,6 +1,6 @@
 {
   "name": "rw-stargate-network",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "private": true,
   "description": "OZ Stargate WebSocket relay and durable transfer coordinator",
   "main": "dist/main.js",
@@ -8,7 +8,7 @@
   "packageManager": "yarn@4.15.0",
   "scripts": {
     "build": "tsc --build tsconfig.build.json",
-    "test": "yarn build && node dist/contract-smoke.js && node dist/dial-smoke.js",
+    "test": "yarn build && node dist/contract-smoke.js && node dist/dial-smoke.js && node scripts/code-migration-smoke.js",
     "start": "node dist/main.js"
   },
   "dependencies": {
