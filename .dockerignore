@@ -5,5 +5,4 @@ dist
 .yarn/install-state.gz
 .env*
 docs
-scripts
 deploy
