@@ -33,6 +33,12 @@ Phase 3B uses `transferStart`, target `transferAccepted`, source `transferReleas
 
 With a test MongoDB reachable through `MONGODB_URI`, run `node scripts/transfer-smoke.js`. It creates a unique temporary database, starts and force-restarts a child relay, validates transfer ownership, release/claim, abort, expiry, return direction and idempotent completion, and drops only that test database afterward.
 
+## Player erasure
+
+Set `STARGATE_ERASURE_KEYS_JSON` on the relay to a JSON object mapping each participating server UUID to a separate, randomly generated 64-character lowercase hexadecimal key. Pass only that server's key to its game process through `STARGATE_ERASURE_KEY`. Keep these keys out of the repository.
+
+An erasure request is signed and scoped to the registered server and network. The relay waits for open transfers. An aborted transfer remains in the source server's scope because that server owns any inventory recovery. The relay acknowledges after deleting the eligible records. Address-book entries are shared within a network and are retained when another server still has an observation for that player.
+
 ## Docker release
 
 Use `devidian/rw-stargate-network:0.5.1` with the example Compose file. Copy the example to your own deployment directory and run `docker compose -f docker-compose.example.yml up -d`. Keep MongoDB on the private Compose network and persist its volume. An existing MongoDB can also be used through `MONGODB_URI` and a dedicated `MONGODB_DATABASE`; a second MongoDB container is unnecessary. Installing this image alone does not configure a public proxy.

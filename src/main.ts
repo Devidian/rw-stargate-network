@@ -1,7 +1,7 @@
 import { DialCoordinator, type DialPeer } from './dial-coordinator.js';
 import { observedGameHost } from './observed-host.js';
 import { createServer } from 'node:http';
-import { randomUUID } from 'node:crypto';
+import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { MongoClient, MongoServerError, type Collection } from 'mongodb';
 import WebSocket, { WebSocketServer } from 'ws';
 import { canonicalCode, MAX_PAYLOAD, parseMessage, stringValue, TRANSFER_WINDOW_MS, type Message, type WorldProfile, WORLD_KEYS } from './protocol.js';
@@ -22,9 +22,11 @@ export class StargateRelay {
   private readonly observedHosts = new WeakMap<WebSocket, string>();
   private readonly dialing: DialCoordinator<Session>;
   private readonly windows = new Map<string, Window>();
+  private readonly playerWrites = new Map<string, Promise<void>>();
   constructor(private readonly servers: Collection<ServerRecord>, private readonly gates: Collection<GateRecord>,
     private readonly players: Collection<PlayerRecord>, private readonly transfers: Collection<TransferRecord>,
-    private readonly addressBooks: Collection<AddressBookRecord>) {
+    private readonly addressBooks: Collection<AddressBookRecord>,
+    private readonly erasureKeys: ReadonlyMap<string, string> = new Map()) {
     const duration = (key: string, fallback: number, max: number) => {
       const value = Number(process.env[key] ?? fallback);
       if (!Number.isInteger(value) || value < 10 || value > max) throw new Error(`invalid_${key}`);
@@ -108,12 +110,14 @@ export class StargateRelay {
         case 'setGateAlias': await this.setGateAlias(session, message); break;
         case 'unregisterGate': await this.unregisterGate(session, message); break;
         case 'getAddressList': await this.addressList(session, message); break;
-        case 'syncAddressBook': await this.syncAddressBook(session, message); break;
+        case 'syncAddressBook': await this.withPlayerWrite(session, message, () => this.syncAddressBook(session, message)); break;
         case 'dialGate': await this.dialGate(session, message); break;
         case 'gateFree': case 'gateBlocked': await this.dialReply(session, message); break;
-        case 'updatePlayer': await this.updatePlayer(session, message); break;
+        case 'updatePlayer': await this.withPlayerWrite(session, message, () => this.updatePlayer(session, message)); break;
+        case 'erasureProbe': await this.erasePlayer(session, message, true); break;
+        case 'erasePlayer': await this.withPlayerWrite(session, message, () => this.erasePlayer(session, message, false)); break;
         case 'playerTrust': await this.playerTrust(session, message); break;
-        case 'transferStart': await this.transferStart(session, message); break;
+        case 'transferStart': await this.withPlayerWrite(session, message, () => this.transferStart(session, message)); break;
         case 'transferAccepted': await this.transferAccepted(session, message); break;
         case 'transferReleased': await this.transferReleased(session, message); break;
         case 'transferClaim': await this.transferClaim(session, message); break;
@@ -125,6 +129,58 @@ export class StargateRelay {
     } catch (error) {
       this.send(socket, 'error', message.requestId, { code: error instanceof Error ? error.message : 'internal_error' });
     }
+  }
+
+  private async withPlayerWrite(session: Session, message: Message, action: () => Promise<void>): Promise<void> {
+    const uid = stringValue(message.payload.uid, 128);
+    const key = JSON.stringify([session.networkCode, uid]);
+    const previous = this.playerWrites.get(key) ?? Promise.resolve();
+    const pending = previous.catch(() => {}).then(() => {
+      if (this.sessions.get(session.serverId) !== session) throw new Error('network_not_initialized');
+      return action();
+    });
+    this.playerWrites.set(key, pending);
+    try {
+      await pending;
+    } finally {
+      if (this.playerWrites.get(key) === pending) this.playerWrites.delete(key);
+    }
+  }
+
+  private async erasePlayer(session: Session, msg: Message, probe: boolean): Promise<void> {
+    const uid = stringValue(msg.payload.uid, 128);
+    const issuedAt = msg.payload.issuedAt;
+    const signature = msg.payload.signature;
+    const key = this.erasureKeys.get(session.serverId);
+    if (!key || typeof issuedAt !== 'number' || !Number.isSafeInteger(issuedAt)
+        || Math.abs(Date.now() - issuedAt) > 30_000
+        || typeof signature !== 'string' || !/^[a-f0-9]{64}$/.test(signature)
+        || !/^[a-f0-9-]{36}$/.test(msg.requestId)) throw new Error('erasure_unauthorized');
+    const signed = [probe ? 'stargate-erasure-probe' : 'stargate-player-erasure',
+      session.serverId, session.networkCode, msg.requestId, uid, issuedAt].join('\n');
+    const expected = createHmac('sha256', key).update(signed).digest();
+    if (!timingSafeEqual(expected, Buffer.from(signature, 'hex'))) throw new Error('erasure_unauthorized');
+    if (probe) {
+      this.send(session.socket, 'erasureAvailable', msg.requestId, {});
+      return;
+    }
+
+    const player = { networkCode: session.networkCode, uid };
+    const ownTransfers = { ...player, $or: [{ sourceServerId: session.serverId }, { targetServerId: session.serverId }] };
+    const settled = { $or: [{ state: 'DONE' as const }, { state: 'ABORTED' as const, sourceServerId: session.serverId }] };
+    const activeStates: TransferState[] = ['PENDING', 'ACCEPTED', 'RELEASED', 'CLAIMED'];
+    if (await this.transfers.findOne({ ...ownTransfers, state: { $in: activeStates } })) {
+      this.send(session.socket, 'playerErasurePending', msg.requestId, {});
+      return;
+    }
+    const ownObservation = { ...player, serverId: session.serverId };
+    const existing = await this.players.findOne(ownObservation);
+    if (existing && !await this.players.findOne({ ...player, serverId: { $ne: session.serverId } })) {
+      await this.addressBooks.deleteMany(player);
+    }
+    await this.transfers.deleteMany({ $and: [ownTransfers, settled] });
+    await this.players.deleteOne(ownObservation);
+    this.send(session.socket, 'playerErased', msg.requestId, {});
   }
 
   setObservedHost(socket: WebSocket, host: string | null): void {
@@ -181,7 +237,8 @@ export class StargateRelay {
       networkCode, computedCode, world, plugins, forbiddenActions, travelEnabled, online: true, updatedAt: new Date() } }, { upsert: true });
     this.sessions.set(serverId, { socket, serverId, networkCode, host, port: port as number, travelEnabled,
       dialSequenceVersion: p.dialSequenceVersion === 1 ? 1 : 0 });
-    this.send(socket, 'networkReady', msg.requestId, { networkCode, computedCode, dialSequenceVersion: 1, changed: !!prior && prior.networkCode !== networkCode });
+    this.send(socket, 'networkReady', msg.requestId, { networkCode, computedCode, dialSequenceVersion: 1,
+      ...(this.erasureKeys.has(serverId) ? { playerErasure: true } : {}), changed: !!prior && prior.networkCode !== networkCode });
     await this.replayTransfers(this.sessions.get(serverId)!);
   }
 
@@ -558,9 +615,16 @@ async function main(): Promise<void> {
   const client = new MongoClient(mongoUri);
   await client.connect();
   const db = client.db(process.env.MONGODB_DATABASE || 'rw_stargate_network');
+  const configuredKeys: unknown = JSON.parse(process.env.STARGATE_ERASURE_KEYS_JSON ?? '{}');
+  if (!configuredKeys || typeof configuredKeys !== 'object' || Array.isArray(configuredKeys)
+      || Object.entries(configuredKeys).some(([id, key]) =>
+        !/^[a-f0-9-]{36}$/.test(id) || typeof key !== 'string' || !/^[a-f0-9]{64}$/.test(key))) {
+    throw new Error('invalid_stargate_erasure_keys');
+  }
+  const erasureKeys = new Map(Object.entries(configuredKeys as Record<string, string>));
   const relay = new StargateRelay(db.collection<ServerRecord>('servers'), db.collection<GateRecord>('gates'),
     db.collection<PlayerRecord>('players'), db.collection<TransferRecord>('transfers'),
-    db.collection<AddressBookRecord>('address_books'));
+    db.collection<AddressBookRecord>('address_books'), erasureKeys);
   await relay.initialize();
   const server = createServer((req, res) => {
     if (req.url === '/health') { res.writeHead(200); res.end('ok'); return; }
