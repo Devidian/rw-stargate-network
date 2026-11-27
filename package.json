@@ -1,6 +1,6 @@
 {
   "name": "rw-stargate-network",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "private": true,
   "description": "OZ Stargate WebSocket relay and durable transfer coordinator",
   "main": "dist/main.js",

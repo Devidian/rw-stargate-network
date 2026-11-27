@@ -1,5 +1,9 @@
 # History
 
+## 0.5.3 — 2026-11-27
+
+- Keep durable transfer transitions in one MongoDB-backed owner and preserve the existing transfer protocol and records.
+
 ## 0.5.0 — 2026-10-04
 
 - Store an optional alias and both local and network addresses for each gate. Return these details with the personal address book so DHD labels can follow each player's preference.
