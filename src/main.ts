@@ -1,3 +1,4 @@
+import { TransferStateStore, type TransferRecord, type TransferState } from './transfer-state.js';
 import { DialCoordinator, type DialPeer } from './dial-coordinator.js';
 import { observedGameHost } from './observed-host.js';
 import { createServer } from 'node:http';
@@ -11,10 +12,6 @@ type GateRecord = { gateId: string; serverId: string; networkCode: string; addre
 type AddressBookRecord = { networkCode: string; uid: string; gateId: string; learnedAt: Date };
 type PlayerRecord = { uid: string; serverId: string; networkCode: string; name: string; playTimeSeconds: number; permissionGroup: string | null; updatedAt: Date };
 type Session = DialPeer & { socket: WebSocket; travelEnabled: boolean };
-type TransferState = 'PENDING' | 'ACCEPTED' | 'RELEASED' | 'CLAIMED' | 'DONE' | 'ABORTED';
-type TransferRecord = { transferId: string; uid: string; networkCode: string; sourceServerId: string; targetServerId: string;
-  sourceGateId: string; targetGateId: string; state: TransferState; payload: Record<string, unknown>;
-  createdAt: Date; updatedAt: Date; expiresAt: Date };
 type Window = { sourceServerId: string; targetServerId: string; sourceGateId: string; targetGateId: string; expiresAt: number; connectionId: string };
 
 export class StargateRelay {
@@ -23,10 +20,12 @@ export class StargateRelay {
   private readonly dialing: DialCoordinator<Session>;
   private readonly windows = new Map<string, Window>();
   private readonly playerWrites = new Map<string, Promise<void>>();
+  private readonly transferStates: TransferStateStore;
   constructor(private readonly servers: Collection<ServerRecord>, private readonly gates: Collection<GateRecord>,
     private readonly players: Collection<PlayerRecord>, private readonly transfers: Collection<TransferRecord>,
     private readonly addressBooks: Collection<AddressBookRecord>,
     private readonly erasureKeys: ReadonlyMap<string, string> = new Map()) {
+    this.transferStates = new TransferStateStore(transfers);
     const duration = (key: string, fallback: number, max: number) => {
       const value = Number(process.env[key] ?? fallback);
       if (!Number.isInteger(value) || value < 10 || value > max) throw new Error(`invalid_${key}`);
@@ -468,74 +467,30 @@ export class StargateRelay {
   }
 
   private async transferAccepted(session: Session, msg: Message): Promise<void> {
-    const transferId = this.transferId(msg);
-    const transfer = await this.transfers.findOne({ transferId, targetServerId: session.serverId,
-      networkCode: session.networkCode });
-    if (!transfer) throw new Error('transfer_not_found');
-    if (transfer.state === 'PENDING') {
-      if (transfer.expiresAt.getTime() <= Date.now()) throw new Error('transfer_expired');
-      await this.transfers.updateOne({ transferId, state: 'PENDING' },
-        { $set: { state: 'ACCEPTED', updatedAt: new Date() } });
-    } else if (transfer.state !== 'ACCEPTED' && transfer.state !== 'RELEASED' && transfer.state !== 'CLAIMED' && transfer.state !== 'DONE') {
-      throw new Error('transfer_aborted');
-    }
-    const latest = (await this.transfers.findOne({ transferId }))!;
-    if (latest.state !== 'ACCEPTED' && latest.state !== 'RELEASED' && latest.state !== 'CLAIMED' && latest.state !== 'DONE') throw new Error('transfer_aborted');
+    const latest = await this.transferStates.accept(this.transferId(msg), session.serverId, session.networkCode);
     this.send(session.socket, 'transferAcceptedAck', msg.requestId, this.statusPayload(latest));
     this.notifySource(latest, 'transferAccepted');
   }
 
   private async transferReleased(session: Session, msg: Message): Promise<void> {
-    const transferId = this.transferId(msg);
-    const transfer = await this.transfers.findOne({ transferId, sourceServerId: session.serverId,
-      networkCode: session.networkCode });
-    if (!transfer) throw new Error('transfer_not_found');
-    if (transfer.state === 'ACCEPTED' && transfer.expiresAt.getTime() > Date.now()) {
-      await this.transfers.updateOne({ transferId, state: 'ACCEPTED' },
-        { $set: { state: 'RELEASED', updatedAt: new Date() } });
-    }
-    const latest = (await this.transfers.findOne({ transferId }))!;
-    if (latest.state !== 'RELEASED' && latest.state !== 'CLAIMED' && latest.state !== 'DONE') throw new Error('transfer_not_released');
+    const latest = await this.transferStates.release(this.transferId(msg), session.serverId, session.networkCode);
     this.notifySource(latest, 'transferReleased');
   }
 
   private async transferClaim(session: Session, msg: Message): Promise<void> {
-    const transferId = this.transferId(msg);
-    const transfer = await this.transfers.findOne({ transferId, targetServerId: session.serverId,
-      networkCode: session.networkCode });
-    if (!transfer) throw new Error('transfer_not_found');
-    if (transfer.state === 'RELEASED' && transfer.expiresAt.getTime() > Date.now()) {
-      await this.transfers.updateOne({ transferId, state: 'RELEASED' },
-        { $set: { state: 'CLAIMED', updatedAt: new Date() } });
-    }
-    const latest = (await this.transfers.findOne({ transferId }))!;
-    if (latest.state !== 'CLAIMED' && latest.state !== 'DONE') throw new Error('transfer_not_claimable');
+    const latest = await this.transferStates.claim(this.transferId(msg), session.serverId, session.networkCode);
     this.send(session.socket, 'transferClaimed', msg.requestId, this.statusPayload(latest));
   }
 
   private async transferDone(session: Session, msg: Message): Promise<void> {
-    const transferId = this.transferId(msg);
-    const transfer = await this.transfers.findOne({ transferId, targetServerId: session.serverId,
-      networkCode: session.networkCode });
-    if (!transfer || (transfer.state !== 'CLAIMED' && transfer.state !== 'DONE')) throw new Error('transfer_not_claimed');
-    if (transfer.state === 'CLAIMED') await this.transfers.updateOne({ transferId, state: 'CLAIMED' },
-      { $set: { state: 'DONE', updatedAt: new Date(), payload: {} } });
-    const latest = (await this.transfers.findOne({ transferId }))!;
+    const latest = await this.transferStates.complete(this.transferId(msg), session.serverId, session.networkCode);
     this.send(session.socket, 'transferDoneAck', msg.requestId, this.statusPayload(latest));
     this.notifySource(latest, 'transferDone');
   }
 
   private async transferAbort(session: Session, msg: Message): Promise<void> {
-    const transferId = this.transferId(msg);
-    const transfer = await this.transfers.findOne({ transferId, networkCode: session.networkCode,
-      ...(msg.type === 'transferInterrupted' ? { targetServerId: session.serverId } : { sourceServerId: session.serverId }) });
-    if (!transfer) throw new Error('transfer_not_found');
-    if (transfer.state === 'PENDING' || transfer.state === 'ACCEPTED' || transfer.state === 'RELEASED') {
-      await this.transfers.updateOne({ transferId, state: { $in: ['PENDING', 'ACCEPTED', 'RELEASED'] } },
-        { $set: { state: 'ABORTED', updatedAt: new Date(), payload: {} } });
-    }
-    const latest = (await this.transfers.findOne({ transferId }))!;
-    if (latest.state !== 'ABORTED') throw new Error('transfer_already_claimed');
+    const latest = await this.transferStates.abort(this.transferId(msg), session.serverId, session.networkCode,
+      msg.type === 'transferInterrupted');
     this.send(session.socket, 'transferAborted', msg.requestId, this.statusPayload(latest));
     this.notifySource(latest, 'transferFailed');
     this.notifyTarget(latest, 'transferCancelled');
@@ -592,13 +547,7 @@ export class StargateRelay {
   }
 
   async expireTransfers(): Promise<void> {
-    const expired = await this.transfers.find({ state: { $in: ['PENDING', 'ACCEPTED', 'RELEASED'] },
-      expiresAt: { $lte: new Date() } }).limit(256).toArray();
-    for (const transfer of expired) {
-      const result = await this.transfers.updateOne({ transferId: transfer.transferId,
-        state: { $in: ['PENDING', 'ACCEPTED', 'RELEASED'] } }, { $set: { state: 'ABORTED', updatedAt: new Date(), payload: {} } });
-      if (!result.modifiedCount) continue;
-      const aborted = { ...transfer, state: 'ABORTED' as const };
+    for await (const aborted of this.transferStates.expire()) {
       this.notifySource(aborted, 'transferFailed');
       this.notifyTarget(aborted, 'transferCancelled');
     }

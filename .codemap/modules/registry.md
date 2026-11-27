@@ -7,5 +7,5 @@ Persist network, server, gate and transfer state in MongoDB. Relay coordinates b
 
 ## Source and tests
 
-- [`StargateRelay`](../../src/main.ts) handles registry and transfer requests. [Protocol](../../src/protocol.ts) supplies payload limits and timing.
-- [Transfer smoke](../../scripts/transfer-smoke.js) and [migration smoke](../../scripts/code-migration-smoke.js) cover persistence-sensitive behavior. MongoDB and relay settings are read in [startup](../../src/main.ts).
+- [`StargateRelay`](../../src/main.ts) handles registry and transfer requests. [`TransferStateStore`](../../src/transfer-state.ts) owns durable acceptance, release, claim, completion, abort and expiry transitions. [Protocol](../../src/protocol.ts) supplies payload limits and timing.
+- [Transfer state smoke](../../scripts/transfer-state-smoke.js), [Mongo transfer smoke](../../scripts/transfer-smoke.js) and [migration smoke](../../scripts/code-migration-smoke.js) cover persistence-sensitive behavior. MongoDB and relay settings are read in [startup](../../src/main.ts).

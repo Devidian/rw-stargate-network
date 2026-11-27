@@ -7,7 +7,7 @@ COPY .yarn/releases ./.yarn/releases
 RUN corepack enable && yarn install --immutable
 COPY tsconfig.json tsconfig.build.json ./
 COPY src ./src
-COPY scripts/code-migration-smoke.js ./scripts/code-migration-smoke.js
+COPY scripts/code-migration-smoke.js scripts/transfer-state-smoke.js ./scripts/
 RUN yarn test
 
 FROM node:24-alpine
